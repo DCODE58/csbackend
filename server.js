@@ -5,26 +5,67 @@ const rateLimit = require("express-rate-limit");
 
 const app = express();
 app.disable("x-powered-by");
+
+// Render (and most hosts) terminate TLS at a proxy in front of the app.
+// Without this, req.ip is the proxy's IP, so every visitor shares one
+// rate-limit bucket.
+app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "10kb" }));
 
-// --- CORS: only allow requests from your own site --------------------------
+/* --------------------------------------------------------------------------
+ * CORS
+ * ------------------------------------------------------------------------ */
+
+// Normalize so "https://Site.com/", "https://site.com" and
+// "HTTPS://SITE.COM" all compare equal.
+const normalizeOrigin = (value) =>
+  String(value || "").trim().replace(/\/+$/, "").toLowerCase();
+
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map((o) => o.trim())
+  .map(normalizeOrigin)
   .filter(Boolean);
+
+const isAllowedOrigin = (origin) => {
+  // No Origin header => curl / server-to-server / health checks. Allow it.
+  if (!origin) return true;
+  return ALLOWED_ORIGINS.includes(normalizeOrigin(origin));
+};
 
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow server-to-server / curl / health checks with no Origin header
-      if (!origin) return callback(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-      callback(new Error("Not allowed by CORS"));
+      // IMPORTANT: never call back with an Error here. Doing so makes the
+      // cors middleware forward the error to the error handler, which replies
+      // *without* CORS headers — the browser then reports a generic
+      // "No 'Access-Control-Allow-Origin' header" and hides the real status.
+      callback(null, isAllowedOrigin(origin));
     },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+    maxAge: 86400,
   })
 );
 
-// --- Rate limiting: protect your DeepSeek quota from abuse ------------------
+// Explicitly reject disallowed browser origins. We echo the origin back so the
+// browser lets the frontend read this 403 + message instead of swallowing it
+// as an opaque network error.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && !isAllowedOrigin(origin)) {
+    console.warn(`Blocked CORS origin: ${origin}`);
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    return res.status(403).json({ error: "Origin not allowed." });
+  }
+  next();
+});
+
+/* --------------------------------------------------------------------------
+ * Rate limiting
+ * ------------------------------------------------------------------------ */
+
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
   max: 15, // 15 messages/minute per IP
@@ -35,9 +76,10 @@ const chatLimiter = rateLimit({
   },
 });
 
-// --- Felicity's persona + grounded company facts ----------------------------
-// Keeping real facts here (not left to the model to guess) avoids hallucinated
-// prices, contact details, or made-up projects.
+/* --------------------------------------------------------------------------
+ * Felicity's persona + grounded company facts
+ * ------------------------------------------------------------------------ */
+
 const SYSTEM_PROMPT = `You are Felicity, the friendly virtual assistant embedded on DCODE's website. About DCODE: - Services: web development, UI/UX design, mobile app development (iOS & Android), cloud infrastructure & migration, AI/automation solutions, and security. - Contact: dcodedevs@gmail.com, +254-768-372532. Based in Nairobi, Kenya, working with clients remotely worldwide. - Portfolio highlights (visible on the Projects page, filterable by category): E-Commerce Platform (Web), Fitness Tracker App (Mobile), Business Analytics Dashboard (Web), Enterprise Cloud Migration (Cloud), Customer Support AI (AI), Supply Chain Blockchain (Web). Guidelines: - Keep answers short and conversational — 2 to 4 sentences. - Never invent a specific price or quote. Pricing depends on project scope — invite the person to share more detail so the team can follow up. - If asked something unrelated to DCODE, its services, or general small talk, gently steer the conversation back to how you can help with their project. - If you don't know something specific, say so and suggest contacting the team directly rather than guessing. - Never claim to be human, and never claim abilities DCODE doesn't have.`;
 
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
@@ -55,11 +97,9 @@ app.post("/api/chat", chatLimiter, async (req, res) => {
         .json({ error: 'A non-empty "message" string is required.' });
     }
     if (message.length > MAX_MESSAGE_LENGTH) {
-      return res
-        .status(400)
-        .json({
-          error: `Message is too long (max ${MAX_MESSAGE_LENGTH} characters).`,
-        });
+      return res.status(400).json({
+        error: `Message is too long (max ${MAX_MESSAGE_LENGTH} characters).`,
+      });
     }
 
     const safeHistory = Array.isArray(history)
@@ -85,11 +125,9 @@ app.post("/api/chat", chatLimiter, async (req, res) => {
 
     if (!process.env.DEEPSEEK_API_KEY) {
       console.error("DEEPSEEK_API_KEY is not set.");
-      return res
-        .status(500)
-        .json({
-          error: "Chat is temporarily unavailable. Please contact us directly.",
-        });
+      return res.status(500).json({
+        error: "Chat is temporarily unavailable. Please contact us directly.",
+      });
     }
 
     const controller = new AbortController();
@@ -120,19 +158,15 @@ app.post("/api/chat", chatLimiter, async (req, res) => {
       console.error("DeepSeek API error:", response.status, errText);
 
       if (response.status === 429) {
-        return res
-          .status(429)
-          .json({
-            error:
-              "Felicity is a little busy right now — please try again shortly.",
-          });
-      }
-      return res
-        .status(502)
-        .json({
+        return res.status(429).json({
           error:
-            "Felicity is having trouble connecting right now. Please email dcodedevs@gmail.com.",
+            "Felicity is a little busy right now — please try again shortly.",
         });
+      }
+      return res.status(502).json({
+        error:
+          "Felicity is having trouble connecting right now. Please email dcodedevs@gmail.com.",
+      });
     }
 
     const data = await response.json();
@@ -140,12 +174,10 @@ app.post("/api/chat", chatLimiter, async (req, res) => {
 
     if (!reply) {
       console.error("DeepSeek response had no content:", JSON.stringify(data));
-      return res
-        .status(502)
-        .json({
-          error:
-            "Felicity is having trouble connecting right now. Please email dcodedevs@gmail.com.",
-        });
+      return res.status(502).json({
+        error:
+          "Felicity is having trouble connecting right now. Please email dcodedevs@gmail.com.",
+      });
     }
 
     res.json({ reply });
@@ -157,21 +189,16 @@ app.post("/api/chat", chatLimiter, async (req, res) => {
         .json({ error: "That took too long to answer — please try again." });
     }
     console.error("Unexpected /api/chat error:", err);
-    res
-      .status(500)
-      .json({
-        error: "Something went wrong. Please try again or contact us directly.",
-      });
+    res.status(500).json({
+      error: "Something went wrong. Please try again or contact us directly.",
+    });
   }
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// Generic error handler (e.g. CORS rejection thrown above)
+// Generic error handler
 app.use((err, req, res, next) => {
-  if (err && err.message === "Not allowed by CORS") {
-    return res.status(403).json({ error: "Origin not allowed." });
-  }
   console.error("Unhandled error:", err);
   res.status(500).json({ error: "Something went wrong." });
 });
@@ -181,7 +208,9 @@ app.listen(PORT, () => {
   console.log(`Felicity backend listening on port ${PORT}`);
   if (ALLOWED_ORIGINS.length === 0) {
     console.warn(
-      "WARNING: ALLOWED_ORIGINS is empty — no browser origins will be permitted until you set it in .env"
+      "WARNING: ALLOWED_ORIGINS is empty — every browser request will be rejected with 403 until you set it."
     );
+  } else {
+    console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
   }
 });
